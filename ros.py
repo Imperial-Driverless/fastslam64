@@ -2,56 +2,68 @@ from typing import Any
 import numpy as np
 import matplotlib.pyplot as plt
 from lib.plotting import (
-    plot_connections, plot_history, plot_landmarks, plot_measurement,
-    plot_particles_weight, plot_particles_grey, plot_confidence_ellipse,
-    plot_sensor_fov, plot_map
+    plot_connections, plot_history, plot_landmarks, plot_measurement, # type: ignore
+    plot_particles_weight, plot_confidence_ellipse, # type: ignore
+    plot_sensor_fov, plot_map # type: ignore
 )
-from lib.particle3 import FlatParticle
+from lib.particle3 import FlatParticle, FlatParticles
 
-import pycuda.driver as cuda
-import pycuda.autoinit
+from pycuda import driver
+import pycuda.autoinit  # type: ignore
 from pycuda.autoinit import context
-from pycuda.driver import limit # type: ignore
+from pycuda.driver import limit  # type: ignore
 from lib.stats import Stats
-from lib.common import CUDAMemory, resample, rescale, get_pose_estimate
 from cuda_modules import CudaModules
 
 from rclpy.node import Node
 
-def wrap_angle(angle):
+cuda = driver
+
+def main():
+    from config_fsonline import config
+    context.set_limit(limit.MALLOC_HEAP_SIZE, config.GPU_HEAP_SIZE_BYTES)  # type: ignore
+
+    experiment = Experiment(config, plot=True)
+    experiment.run()
+
+def wrap_angle(angle: float):
     return np.arctan2(np.sin(angle), np.cos(angle))
 
-def rb2xy(pose, rb):
+
+def rb2xy(pose: tuple[float, float, float], rb: tuple[float, float]):
     [_, _, theta] = pose
     [r, b] = rb
     return [r * np.cos(b + theta), r * np.sin(b + theta)]
 
-def xy2rb(pose, landmark):
-    position = pose[:2]
-    vector_to_landmark = np.array(landmark - position, dtype=np.float64)
 
-    r = np.linalg.norm(vector_to_landmark)
-    b = np.arctan2(vector_to_landmark[1], vector_to_landmark[0]) - pose[2]
+def xy2rb(pose: tuple[float, float, float], landmark: tuple[float, float]) -> tuple[float, float]:
+    position = pose[:2]
+    vector_to_landmark = np.float64(landmark) - np.float64(position) # type: ignore
+
+    r = np.linalg.norm(vector_to_landmark) # type: ignore
+    b = np.arctan2(vector_to_landmark[1], vector_to_landmark[0]) - pose[2] # type: ignore
     b = wrap_angle(b)
 
-    return r, b
+    return float(r), b
+
 
 class FastSLAMNode(Node):
     def __init__(
-        self, 
-        num_threads: int, 
-        num_particles: int, 
-        max_landmarks: int, 
-        sensor_range: float, 
+        self,
+        num_threads: int,
+        num_particles: int,
+        max_landmarks: int,
+        sensor_range: float,
         sensor_fov: float,
         odometry_variance: Any,
         sensor_covariance: Any,
         particle_size: int,
         start_position: tuple[float, float, float],
+        max_measurements: int,
         update_threshold: float,
     ) -> None:
 
-        assert num_threads <= 1024 # cannot run more in a single block
+        assert num_threads <= 1024  # cannot run more in a single block
         assert num_particles >= num_threads
         assert num_particles % num_threads == 0
         rng_seed = 0
@@ -72,12 +84,14 @@ class FastSLAMNode(Node):
             N_PARTICLES=num_particles
         )
 
-        self.memory = CUDAMemory(config)
+        self.memory = CUDAMemory(
+            num_particles, particle_size, max_landmarks, max_measurements
+        )
         self.weights = np.zeros(num_particles, dtype=np.float64)
-        self.particles = FlatParticle.get_initial_particles(num_particles, max_landmarks, start_position, sigma=0.2) # type: ignore
+        self.particles = FlatParticle.get_initial_particles(num_particles, max_landmarks, start_position, sigma=0.2)  # type: ignore
 
-        cuda.memcpy_htod(self.memory.cov, self.sensor_covariance) # type: ignore
-        cuda.memcpy_htod(self.memory.particles, self.particles) # type: ignore
+        cuda.memcpy_htod(self.memory.cov, self.sensor_covariance)
+        cuda.memcpy_htod(self.memory.particles, self.particles)
 
         self.particles_per_thread = num_particles//num_threads
 
@@ -86,29 +100,32 @@ class FastSLAMNode(Node):
             np.int32(rng_seed), block=(num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
         )
 
-        
+        self.block_size = self.num_particles if self.num_particles < 32 else 32
 
-    def get_particles(self) -> 'np.ndarray[Any, Any]':
+    def get_particles(self) -> FlatParticles:
         cuda.memcpy_dtoh(self.particles, self.memory.particles)
         return self.particles
 
-    def measurement_callback(self, est_odometry: tuple[float, float, float], measurements_rb: list[tuple[float, float]]) -> tuple[float, float, float]:
+    def measurement_callback(
+        self, 
+        est_odometry: tuple[float, float, float], 
+        measurements_rb: list[tuple[float, float]]
+    ) -> tuple[float, float, float]:
 
         self.cuda_functions.reset_weights(
             self.memory.particles,
             block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
         )
 
-        cuda.memcpy_htod(self.memory.measurements, np.float64(measurements_rb))
+        cuda.memcpy_htod(self.memory.measurements, np.array(measurements_rb, dtype=np.float64))
 
         self.cuda_functions.predict_from_imu(
             self.memory.particles,
             np.float64(est_odometry[0]), np.float64(est_odometry[1]), np.float64(est_odometry[2]),
-            np.float64(self.odometry_variance[0] ** 0.5), np.float64(self.odometry_variance[1] ** 0.5), np.float64(self.odometry_variance[2] ** 0.5),
+            np.float64(self.odometry_variance[0] ** 0.5), np.float64(self.odometry_variance[1]
+                                                                     ** 0.5), np.float64(self.odometry_variance[2] ** 0.5),
             block=(self.max_landmarks, 1, 1), grid=(self.num_particles//self.max_landmarks, 1, 1)
         )
-
-        block_size = self.num_particles if self.num_particles < 32 else 32
 
         self.cuda_functions.update(
             self.memory.particles, np.int32(1),
@@ -118,10 +135,9 @@ class FastSLAMNode(Node):
             self.memory.cov, np.float64(self.update_threshold),
             np.float64(self.sensor_range), np.float64(self.sensor_fov),
             np.int32(self.max_landmarks),
-            block=(block_size, 1, 1), grid=(self.num_particles//block_size, 1, 1)
+            block=(self.block_size, 1, 1), grid=(self.num_particles//self.block_size, 1, 1)
         )
 
-        
         self.cuda_functions.sum_weights(
             self.memory.particles, self.memory.rescale_sum,
             block=(self.num_threads, 1, 1)
@@ -138,10 +154,9 @@ class FastSLAMNode(Node):
             block=(self.num_threads, 1, 1)
         )
 
-
         # synchronize particles from cuda device to host
-        cuda.memcpy_dtoh(self.particles, self.memory.particles) # type: ignore
-        
+        cuda.memcpy_dtoh(self.particles, self.memory.particles)  # type: ignore
+
         self.cuda_functions.get_weights(
             self.memory.particles, self.memory.weights,
             block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
@@ -150,9 +165,9 @@ class FastSLAMNode(Node):
 
         neff = FlatParticle.neff(self.weights)
         if neff < 0.6*self.num_particles:
-            cumsum = np.cumsum(self.weights)
+            cumsum = np.cumsum(self.weights) # type: ignore
 
-            cuda.memcpy_htod(self.memory.cumsum, cumsum) # type: ignore
+            cuda.memcpy_htod(self.memory.cumsum, cumsum)  # type: ignore
 
             self.cuda_functions.systematic_resample(
                 self.memory.weights, self.memory.cumsum, np.float64(0.5), self.memory.ancestors,
@@ -178,14 +193,12 @@ class FastSLAMNode(Node):
                 block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
             )
 
-        
         estimate = cuda.from_device(self.memory.mean_position, shape=(3,), dtype=np.float64)
-        return estimate
+        return estimate[0], estimate[1], estimate[2]
 
-    
 
 class Experiment:
-    def __init__(self, config: Any, plot: bool=True):
+    def __init__(self, config: Any, plot: bool = True):
         self.slam_algo = FastSLAMNode(
             num_threads=config.THREADS,
             num_particles=config.N,
@@ -197,13 +210,14 @@ class Experiment:
             particle_size=config.PARTICLE_SIZE,
             start_position=config.START_POSITION,
             update_threshold=config.THRESHOLD,
+            max_measurements=config.sensor.MAX_MEASUREMENTS,
         )
 
         self.plot = plot
         if self.plot:
-            _, self.ax = plt.subplots(2, 1, figsize=(10, 5))
-            self.ax[0].axis('scaled')
-            self.ax[1].axis('scaled')
+            _, self.ax = plt.subplots(2, 1, figsize=(10, 5)) # type: ignore
+            self.ax[0].axis('scaled') # type: ignore
+            self.ax[1].axis('scaled') # type: ignore
 
         self.stats = Stats("Loop")
         self.stats.add_pose(config.START_POSITION, config.START_POSITION)
@@ -211,9 +225,9 @@ class Experiment:
         self.config = config
 
     def run(self):
-         
+
         for i in range(self.config.ODOMETRY.shape[0]):
-            pose = self.config.ODOMETRY[i]
+            pose: tuple[float, float, float] = self.config.ODOMETRY[i]
 
             visible_measurements = self.config.sensor.MEASUREMENTS[i]
             visible_measurements = [xy2rb(pose, m) for m in visible_measurements]
@@ -222,33 +236,32 @@ class Experiment:
             estimate = self.slam_algo.measurement_callback(self.config.EST_ODOMETRY[i], visible_measurements)
             self.stats.stop_measuring("Loop")
 
-            self.stats.add_pose([pose[0], pose[1], pose[2]], estimate)
+            self.stats.add_pose((pose[0], pose[1], pose[2]), estimate)
 
             if self.plot:
                 self.visualize(self.slam_algo.get_particles(), pose, visible_measurements)
-        
+
         self.slam_algo.memory.free()
         self.stats.summary()
         print(self.stats.mean_path_deviation())
 
-    def visualize(self, particles: 'np.ndarray[Any, Any]', pose: tuple[float, float, float], measurements_rb: list[tuple[float, float]]):
-        
+    def visualize(self, particles: FlatParticles, pose: tuple[float, float, float], measurements_rb: list[tuple[float, float]]):
 
         self.ax[0].clear()
         self.ax[1].clear()
-        self.ax[0].set_xlim([-160, 10])
-        self.ax[0].set_ylim([-30, 50])
-        self.ax[1].set_xlim([-160, 10])
-        self.ax[1].set_ylim([-30, 50])
+        self.ax[0].set_xlim([-160, 10])  # type: ignore
+        self.ax[0].set_ylim([-30, 50])  # type: ignore
+        self.ax[1].set_xlim([-160, 10])  # type: ignore
+        self.ax[1].set_ylim([-30, 50])  # type: ignore
         self.ax[0].set_axis_off()
         self.ax[1].set_axis_off()
 
         plot_sensor_fov(self.ax[0], pose, self.config.sensor.RANGE, self.config.sensor.FOV)
         plot_sensor_fov(self.ax[1], pose, self.config.sensor.RANGE, self.config.sensor.FOV)
 
-        visible_measurements = np.float64([rb2xy(pose, rb) for rb in measurements_rb])
+        visible_measurements = np.array([rb2xy(pose, rb) for rb in measurements_rb], dtype=np.float64)
 
-        if(visible_measurements.size != 0):
+        if (visible_measurements.size != 0):
             plot_connections(self.ax[0], pose, visible_measurements + pose[:2])
 
         plot_landmarks(self.ax[0], self.config.LANDMARKS, color="blue", zorder=100)
@@ -257,10 +270,10 @@ class Experiment:
         # plot_history(self.ax[0], self.config.ODOMETRY[:i], color='red')
 
         plot_particles_weight(self.ax[0], particles)
-        if(visible_measurements.size != 0):
+        if (visible_measurements.size != 0):
             plot_measurement(self.ax[0], pose[:2], visible_measurements, color="orange", zorder=103)
 
-        best = np.argmax(FlatParticle.w(particles))
+        best: int = np.argmax(FlatParticle.w(particles)) # type: ignore
         plot_landmarks(self.ax[1], self.config.LANDMARKS, color="black")
         covariances = FlatParticle.get_covariances(particles, best)
 
@@ -269,17 +282,51 @@ class Experiment:
         for i, landmark in enumerate(FlatParticle.get_landmarks(particles, best)):
             plot_confidence_ellipse(self.ax[1], landmark, covariances[i], n_std=3)
 
-        plt.pause(0.001)
+        plt.pause(0.001) # type: ignore
+
+
+DOUBLE = 8
+
+
+class CUDAMemory:
+    def __init__(
+        self, 
+        num_particles: int,
+        particle_size: int,
+        max_landmarks: int,
+        max_mearurements: int
+    ) -> None:
+        self.particles = cuda.mem_alloc(DOUBLE * num_particles * particle_size)
+
+        self.scratchpad_block_size = 2 * num_particles * max_landmarks
+        self.scratchpad = cuda.mem_alloc(DOUBLE * self.scratchpad_block_size)
+
+        self.measurements = cuda.mem_alloc(DOUBLE * 2 * max_mearurements)
+        self.weights = cuda.mem_alloc(DOUBLE * num_particles)
+        self.ancestors = cuda.mem_alloc(DOUBLE * num_particles)
+        self.ancestors_aux = cuda.mem_alloc(DOUBLE * num_particles)
+        self.rescale_sum = cuda.mem_alloc(DOUBLE)
+        self.cov = cuda.mem_alloc(DOUBLE * 4)
+        self.mean_position = cuda.mem_alloc(DOUBLE * 3)
+        self.cumsum = cuda.mem_alloc(DOUBLE * num_particles)
+        self.c = cuda.mem_alloc(DOUBLE * num_particles)
+        self.d = cuda.mem_alloc(DOUBLE * num_particles)
+
+
+    def free(self):
+        self.particles.free()
+        self.scratchpad.free()
+        self.measurements.free()
+        self.weights.free()
+        self.ancestors.free()
+        self.ancestors_aux.free()
+        self.rescale_sum.free()
+        self.cov.free()
+        self.mean_position.free()
+        self.cumsum.free()
+        self.c.free()
+        self.d.free()
 
 if __name__ == "__main__":
-    from config_fsonline import config
-    context.set_limit(limit.MALLOC_HEAP_SIZE, config.GPU_HEAP_SIZE_BYTES) # type: ignore
-
-    experiment = Experiment(config, plot=True)
-    experiment.run()
-
+    main()
     
-
-    
-
-

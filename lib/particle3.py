@@ -1,70 +1,49 @@
-import math
 import numpy as np
-from numpy.random import random
-import time
+from typing import Any, NewType
 
-def systematic_resample(weights):
-    N = weights.shape[0]
-
-    # make N subdivisions, and choose positions with a consistent random offset
-    positions = (random() + np.arange(N)) / N
-
-    indexes = np.zeros(N, dtype=np.int32)
-    cumulative_sum = np.cumsum(weights)
-    # prevent float imprecision
-    cumulative_sum[-1] = 1.0
-
-    i, j = 0, 0
-    while i < N:
-        if positions[i] < cumulative_sum[j]:
-            indexes[i] = j
-            i += 1
-        else:
-            j += 1
-    return indexes
-
+FlatParticles = NewType('FlatParticles', 'np.ndarray[Any, Any]')
 
 class FlatParticle(object):
     @staticmethod
-    def x(particles):
+    def x(particles: FlatParticles):
         max_landmarks = int(particles[4])
         step = 6 + 7*max_landmarks
         return particles[0::step]
 
     @staticmethod
-    def y(particles):
+    def y(particles: FlatParticles):
         max_landmarks = int(particles[4])
         step = 6 + 7*max_landmarks
         return particles[1::step]
 
     @staticmethod
-    def w(particles):
+    def w(particles: FlatParticles):
         max_landmarks = int(particles[4])
         step = 6 + 7*max_landmarks
         return particles[3::step]
 
     @staticmethod
-    def len(particles):
+    def len(particles: FlatParticles):
         max_landmarks = int(particles[4])
         length = particles.shape[0]
         return int(length/(6 + 7*max_landmarks))
 
     @staticmethod
-    def get_particle(particles, i):
+    def get_particle(particles: FlatParticles, i: int):
         max_landmarks = int(particles[4])
         size = 6 + 7*max_landmarks
         offset = size * i
         return particles[offset:offset+size]
 
     @staticmethod
-    def get_landmarks(particles, i):
+    def get_landmarks(particles: FlatParticles, i: int):
         particle = FlatParticle.get_particle(particles, i)
         n_landmarks = int(particle[5])
 
         return particle[6:6+2*n_landmarks].reshape((n_landmarks, 2))
 
     @staticmethod
-    def get_covariances(particles, i):
+    def get_covariances(particles: FlatParticles, i: int):
         particle = FlatParticle.get_particle(particles, i)
         max_landmarks = int(particle[4])
         n_landmarks = int(particle[5])
@@ -82,7 +61,7 @@ class FlatParticle(object):
         return covariances
 
     @staticmethod
-    def get_initial_particles(n_particles: int, max_landmarks: int, starting_position: np.ndarray, sigma: float):
+    def get_initial_particles(n_particles: int, max_landmarks: int, starting_position: 'np.ndarray[Any, Any]', sigma: float) -> FlatParticles:
         step = 6 + 7*max_landmarks
         particles = np.zeros(n_particles * step, dtype=np.float64)
 
@@ -92,8 +71,8 @@ class FlatParticle(object):
         particles[3::step] = 1/n_particles
         particles[4::step] = float(max_landmarks)
 
-        return particles
+        return FlatParticles(particles)
 
     @staticmethod
-    def neff(weights) -> float:
-        return 1.0/np.sum(np.square(weights))
+    def neff(weights: 'np.ndarray[Any, Any]') -> float:
+        return 1.0/np.sum(np.square(weights)) # type: ignore

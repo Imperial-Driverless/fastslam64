@@ -1,10 +1,11 @@
 import time
+from typing import Iterable
 import numpy as np
 
 class Event(object):
-    def __init__(self, name):
+    def __init__(self, name: str):
         self.name = name
-        self.times = []
+        self.times: list[float] = []
         self.start = None
 
     def start_measuring(self):
@@ -17,32 +18,32 @@ class Event(object):
         self.times.append(time.time() - self.start)
 
 class Stats(object):
-    def __init__(self, *events):
-        self.events = {
+    def __init__(self, *events: str):
+        self.events: dict[str, Event] = {
             name: Event(name) for name in events
         }
 
-        self.ground_truth_path = []
-        self.predicted_path = []
+        self.ground_truth_path: list[tuple[float, float, float]] = []
+        self.predicted_path: list[tuple[float, float, float]] = []
 
-    def start_measuring(self, name):
+    def start_measuring(self, name: str):
         self.events[name].start_measuring()
 
-    def stop_measuring(self, name):
+    def stop_measuring(self, name: str):
         self.events[name].stop_measuring()
 
-    def add_pose(self, ground_truth, predicted):
+    def add_pose(self, ground_truth: tuple[float, float, float], predicted: tuple[float, float, float]):
         self.ground_truth_path.append(ground_truth)
         self.predicted_path.append(predicted)
 
-    def mean_path_deviation(self):
+    def mean_path_deviation(self) -> tuple[float, float]:
         ground_truth = np.array(self.ground_truth_path)[:, :2]
         predicted = np.array(self.predicted_path)[:, :2]
 
-        dist = np.linalg.norm(ground_truth - predicted, axis=1)
-        return np.mean(dist), np.std(dist)
+        dist = np.linalg.norm(ground_truth - predicted, axis=1) # type: ignore
+        return np.mean(dist), np.std(dist) # type: ignore
 
-    def summary(self, names=None):
+    def summary(self, names: Iterable[str] | None=None):
         if names is None:
             names = self.events.keys()
 

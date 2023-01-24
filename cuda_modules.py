@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 from pycuda.compiler import SourceModule
 import pycuda.autoinit # type: ignore
 
@@ -11,19 +12,35 @@ class CudaModules:
         ]
 
         module = SourceModule(Path("cuda/fastslam.cu").read_text(), options=self.options, no_extern_c=True)
-        
-        self.init_rng = module.get_function("init_rng")
-        self.write_to_c = module.get_function("write_to_c")
-        self.reset_weights = module.get_function("reset_weights")
-        self.write_ = module.get_function("reset_weights")
-        self.get_weights = module.get_function("get_weights")
-        self.predict_from_imu = module.get_function("predict_from_imu")
-        self.update = module.get_function("update")
-        self.sum_weights = module.get_function("sum_weights")
-        self.divide_weights = module.get_function("divide_weights")
-        self.get_mean_position = module.get_function("get_mean_position")
-        self.systematic_resample = module.get_function("systematic_resample")
-        self.reset = module.get_function("reset")
-        self.prepermute = module.get_function("prepermute")
-        self.permute = module.get_function("permute")
-        self.copy_inplace = module.get_function("copy_inplace")
+        self.module = module
+
+    def init_rng(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("init_rng")(*args, **kwargs) # type: ignore
+    def write_to_c(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("write_to_c")(*args, **kwargs) # type: ignore
+    def reset_weights(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("reset_weights")(*args, **kwargs) # type: ignore
+    def write_(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("write_")(*args, **kwargs) # type: ignore
+    def get_weights(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("get_weights")(*args, **kwargs) # type: ignore
+    def predict_from_imu(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("predict_from_imu")(*args, **kwargs) # type: ignore
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("update")(*args, **kwargs) # type: ignore
+    def sum_weights(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("sum_weights")(*args, **kwargs) # type: ignore
+    def divide_weights(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("divide_weights")(*args, **kwargs) # type: ignore
+    def get_mean_position(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("get_mean_position")(*args, **kwargs) # type: ignore
+    def systematic_resample(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("systematic_resample")(*args, **kwargs) # type: ignore
+    def reset(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("reset")(*args, **kwargs) # type: ignore
+    def prepermute(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("prepermute")(*args, **kwargs) # type: ignore
+    def permute(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("permute")(*args, **kwargs) # type: ignore
+    def copy_inplace(self, *args: Any, **kwargs: Any) -> None:
+        return self.module.get_function("copy_inplace")(*args, **kwargs) # type: ignore
