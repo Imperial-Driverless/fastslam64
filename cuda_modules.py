@@ -10,13 +10,20 @@ class CudaModules:
             f'-DTHREADS={THREADS}',
         ]
 
-        self.predict = self.load_module("cuda/predict.cu", no_extern_c=True)
-        self.update = self.load_module("cuda/update.cu")
-        self.rescale = self.load_module("cuda/rescale.cu")
-        self.resample = self.load_module("cuda/resample.cu")
-        self.weights_and_mean = self.load_module("cuda/weights_and_mean_position.cu")
-        self.permute = self.load_module("cuda/permute.cu")
-
-    def load_module(self, path: str, no_extern_c: bool=False) -> SourceModule:
-        return SourceModule(Path(path).read_text(), options=self.options, no_extern_c=no_extern_c)
+        module = SourceModule(Path("cuda/fastslam.cu").read_text(), options=self.options, no_extern_c=True)
         
+        self.init_rng = module.get_function("init_rng")
+        self.write_to_c = module.get_function("write_to_c")
+        self.reset_weights = module.get_function("reset_weights")
+        self.write_ = module.get_function("reset_weights")
+        self.get_weights = module.get_function("get_weights")
+        self.predict_from_imu = module.get_function("predict_from_imu")
+        self.update = module.get_function("update")
+        self.sum_weights = module.get_function("sum_weights")
+        self.divide_weights = module.get_function("divide_weights")
+        self.get_mean_position = module.get_function("get_mean_position")
+        self.systematic_resample = module.get_function("systematic_resample")
+        self.reset = module.get_function("reset")
+        self.prepermute = module.get_function("prepermute")
+        self.permute = module.get_function("permute")
+        self.copy_inplace = module.get_function("copy_inplace")

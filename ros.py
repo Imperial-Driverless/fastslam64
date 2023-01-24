@@ -66,7 +66,7 @@ class FastSLAMNode(Node):
         self.particle_size = particle_size
         self.update_threshold = update_threshold
 
-        self.cuda_modules = CudaModules(
+        self.cuda_functions = CudaModules(
             THREADS=num_threads,
             PARTICLE_SIZE=particle_size,
             N_PARTICLES=num_particles
@@ -82,7 +82,7 @@ class FastSLAMNode(Node):
         self.particles_per_thread = num_particles//num_threads
 
         np.random.seed(0)
-        self.cuda_modules.predict.get_function("init_rng")(
+        self.cuda_functions.init_rng(
             np.int32(rng_seed), block=(num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
         )
 
@@ -94,14 +94,14 @@ class FastSLAMNode(Node):
 
     def measurement_callback(self, est_odometry: tuple[float, float, float], measurements_rb: list[tuple[float, float]]) -> tuple[float, float, float]:
 
-        self.cuda_modules.resample.get_function("reset_weights")(
+        self.cuda_functions.reset_weights(
             self.memory.particles,
             block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
         )
 
         cuda.memcpy_htod(self.memory.measurements, np.float64(measurements_rb))
 
-        self.cuda_modules.predict.get_function("predict_from_imu")(
+        self.cuda_functions.predict_from_imu(
             self.memory.particles,
             np.float64(est_odometry[0]), np.float64(est_odometry[1]), np.float64(est_odometry[2]),
             np.float64(self.odometry_variance[0] ** 0.5), np.float64(self.odometry_variance[1] ** 0.5), np.float64(self.odometry_variance[2] ** 0.5),
@@ -110,7 +110,7 @@ class FastSLAMNode(Node):
 
         block_size = self.num_particles if self.num_particles < 32 else 32
 
-        self.cuda_modules.update.get_function("update")(
+        self.cuda_functions.update(
             self.memory.particles, np.int32(1),
             self.memory.scratchpad, np.int32(self.memory.scratchpad_block_size),
             self.memory.measurements,
@@ -122,18 +122,18 @@ class FastSLAMNode(Node):
         )
 
         
-        self.cuda_modules.rescale.get_function("sum_weights")(
+        self.cuda_functions.sum_weights(
             self.memory.particles, self.memory.rescale_sum,
             block=(self.num_threads, 1, 1)
         )
 
-        self.cuda_modules.rescale.get_function("divide_weights")(
+        self.cuda_functions.divide_weights(
             self.memory.particles, self.memory.rescale_sum,
             block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
         )
 
         # get pose estimate
-        self.cuda_modules.weights_and_mean.get_function("get_mean_position")(
+        self.cuda_functions.get_mean_position(
             self.memory.particles, self.memory.mean_position,
             block=(self.num_threads, 1, 1)
         )
@@ -142,7 +142,7 @@ class FastSLAMNode(Node):
         # synchronize particles from cuda device to host
         cuda.memcpy_dtoh(self.particles, self.memory.particles) # type: ignore
         
-        self.cuda_modules.weights_and_mean.get_function("get_weights")(
+        self.cuda_functions.get_weights(
             self.memory.particles, self.memory.weights,
             block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
         )
@@ -154,26 +154,26 @@ class FastSLAMNode(Node):
 
             cuda.memcpy_htod(self.memory.cumsum, cumsum) # type: ignore
 
-            self.cuda_modules.resample.get_function("systematic_resample")(
+            self.cuda_functions.systematic_resample(
                 self.memory.weights, self.memory.cumsum, np.float64(0.5), self.memory.ancestors,
                 block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
             )
 
-            self.cuda_modules.permute.get_function("reset")(self.memory.d, np.int32(self.num_particles), block=(
+            self.cuda_functions.reset(self.memory.d, np.int32(self.num_particles), block=(
                 self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1))
-            self.cuda_modules.permute.get_function("prepermute")(self.memory.ancestors, self.memory.d, block=(
+            self.cuda_functions.prepermute(self.memory.ancestors, self.memory.d, block=(
                 self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1))
-            self.cuda_modules.permute.get_function("permute")(self.memory.ancestors, self.memory.c, self.memory.d, np.int32(
+            self.cuda_functions.permute(self.memory.ancestors, self.memory.c, self.memory.d, np.int32(
                 self.num_particles), block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1))
-            self.cuda_modules.permute.get_function("write_to_c")(self.memory.ancestors, self.memory.c, self.memory.d, block=(
+            self.cuda_functions.write_to_c(self.memory.ancestors, self.memory.c, self.memory.d, block=(
                 self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1))
 
-            self.cuda_modules.resample.get_function("copy_inplace")(
+            self.cuda_functions.copy_inplace(
                 self.memory.particles, self.memory.c,
                 block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
             )
 
-            self.cuda_modules.resample.get_function("reset_weights")(
+            self.cuda_functions.reset_weights(
                 self.memory.particles,
                 block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
             )

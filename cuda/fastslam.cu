@@ -1,11 +1,299 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <math.h>
+#include <curand_kernel.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265359
 #endif
+
+
 #define MIN(a,b) (((a)<(b))?(a):(b))
+
+__device__ double* get_particle(double *particles, int i) {
+    return (particles + PARTICLE_SIZE*i);
+}
+
+// Manual extern "C" to stop name mangling shenanigans
+// Otherwise doesn't compile because curand complains
+extern "C" {
+
+__global__ void reset(int *d, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    d[i] = n;
+}
+
+__global__ void prepermute(int *ancestors, int *d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // d[ancestors[i]] = i;
+
+    int *p = d + ancestors[i];
+    atomicMin(p, i);
+}
+
+__global__ void permute(int *ancestors, int *c, int *d, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int x = d[ancestors[i]];
+    if(x != i) {
+        x = i;
+        while(d[x] < n) {
+            x = d[x];
+        }
+        d[x] = i;
+    }
+}
+
+
+__global__ void write_to_c(int *ancestors, int *c, int *d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    c[i] = ancestors[d[i]];
+}
+
+
+// Based on https://stackoverflow.com/questions/46169633/how-to-generate-random-number-inside-pycuda-kernel    
+// Each thread has a random state
+__device__ curandState_t* states[N_PARTICLES];
+
+
+// This function is only called once to initialize the rngs.
+__global__ void init_rng(int seed)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    curandState_t* s = new curandState_t;
+    curand_init(seed, i, 0, s);
+    states[i] = s;
+}
+
+
+__global__ void predict_from_imu(double *particles,
+    double x, double y, double theta, double sigma_x, double sigma_y, double sigma_theta) {
+    
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    double *particle = get_particle(particles, i);
+    // curand_normal() samples from standard normal
+    // to get a general N(mu, sigma), we use Y = mu + sigma*X,
+    // though in our case mu=0.
+    particle[0] = x + sigma_x * curand_normal(states[i]);
+    particle[1] = y + sigma_y * curand_normal(states[i]);
+    particle[2] = theta + sigma_theta * curand_normal(states[i]);
+    particle[2] = atan2(sin(particle[2]), cos(particle[2]));
+}
+
+// Moves particles based on the control input and movement model.
+__global__ void predict_from_model(double *particles, double ua, double ub, double sigma_a, double sigma_b, double dt) {
+    if(ua == 0.0 && ub == 0.0) {
+        return;
+    }
+
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    double *particle = get_particle(particles, i);
+
+    ua += sigma_a * curand_normal(states[i]);
+    ub += sigma_b * curand_normal(states[i]);
+
+    double angle = particle[2];
+
+    // curand_normal() samples from standard normal
+    // to get a general N(mu, sigma), we use Y = mu + sigma*X,
+    // though in our case mu=0.
+    particle[2] += (ua * dt);
+    // particle[2] = fmod(particle[2], (double)(2*M_PI));
+    particle[2] = atan2(sin(particle[2]), cos(particle[2]));
+
+
+    double dist = (ub * dt);
+    particle[0] += cos(angle) * dist;
+    particle[1] += sin(angle) * dist;
+}
+
+// Moves particles based on the control input and movement model.
+__global__ void predict_from_fsonline_model(double *particles, double ua, double ub, double uc, double sigma_a, double sigma_b, double dt) {
+    if(ua == 0.0 && ub == 0.0 && uc == 0.0) {
+        return;
+    }
+
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    double *particle = get_particle(particles, i);
+
+    ua += sigma_a * curand_normal(states[i]);
+    ub += sigma_b * curand_normal(states[i]);
+    uc += sigma_a * curand_normal(states[i]);
+
+    // curand_normal() samples from standard normal
+    // to get a general N(mu, sigma), we use Y = mu + sigma*X,
+    // though in our case mu=0.
+    particle[2] += (ua * dt);
+    // particle[2] = fmod(particle[2], (double)(2*M_PI));
+    particle[2] = fmod(particle[2], (double)(2*M_PI));
+    // particle[2] = atan2(sin(particle[2]), cos(particle[2]));
+
+    double dist = (ub * dt);
+    particle[0] += cos(particle[2]) * dist;
+    particle[1] += sin(particle[2]) * dist;
+
+    particle[2] += (uc * dt);
+    particle[2] = fmod(particle[2], (double)(2*M_PI));
+}
+
+
+
+
+/*
+ * Copies particles in place given by the ancestor vector
+ */
+__global__ void copy_inplace(
+    double *particles, int *ancestors)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    
+    if(i == ancestors[i]) {
+        return;
+    }
+
+    double *source = get_particle(particles, ancestors[i]);
+    double *dest = get_particle(particles, i);
+
+    int max_landmarks = (int)source[4];
+    int n_landmarks = (int)source[5];
+
+    dest[0] = source[0];
+    dest[1] = source[1];
+    dest[2] = source[2];
+    dest[3] = source[3];
+    dest[4] = source[4];
+    dest[5] = source[5];
+
+    for(int k = 0; k < n_landmarks; k++) {
+        dest[6+2*k] = source[6+2*k];
+        dest[6+2*k+1] = source[6+2*k+1];
+
+        dest[6+2*max_landmarks+4*k] = source[6+2*max_landmarks+4*k];
+        dest[6+2*max_landmarks+4*k+1] = source[6+2*max_landmarks+4*k+1];
+        dest[6+2*max_landmarks+4*k+2] = source[6+2*max_landmarks+4*k+2];
+        dest[6+2*max_landmarks+4*k+3] = source[6+2*max_landmarks+4*k+3];
+
+        dest[6+6*max_landmarks+k] = source[6+6*max_landmarks+k];
+    }
+}
+}
+
+__global__ void copy_inplace_coalesced(
+    double *particles, int *ancestors)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    for(int k = 0; k < N_PARTICLES; k++) {
+        double *source = get_particle(particles, ancestors[i]);
+        double *dest = get_particle(particles, i);
+
+        dest[i] = source[i];
+    }
+}
+
+extern "C" {
+__global__ void reset_weights(double *particles) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    
+    double *particle = get_particle(particles, i);
+    particle[3] = 1.0/N_PARTICLES;
+}
+
+__global__ void systematic_resample(double *weights, double *cumsum, double rand, int *ancestors) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    
+    int left = ceil((cumsum[i]*N_PARTICLES - weights[i]*N_PARTICLES) - rand);
+    int right = ceil((cumsum[i]*N_PARTICLES) - rand);
+
+    for(int j = left; j < right; j++) {
+        ancestors[j] = i;
+    }
+}
+}
+
+
+/*
+ * Calculates neff.
+ * Needs to run in a single block.
+ */
+ __global__ void get_neff(double *particles, double *neff) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    double square_sum = 0;
+
+    for (int i = idx; i < N_PARTICLES; i += THREADS) {
+        double *particle = get_particle(particles, i);
+        square_sum += (double)particle[3] * (double)particle[3];
+    }
+
+    __shared__ double r_square_sum[THREADS];
+    r_square_sum[idx] = square_sum;
+
+    __syncthreads();
+
+    for (int size = THREADS/2; size > 0; size /= 2) {
+        if (idx < size) {
+            r_square_sum[idx] += r_square_sum[idx + size];
+        }
+        __syncthreads();
+    }
+
+    if (idx == 0) {
+        *neff = 1.0/r_square_sum[0];
+    }
+}
+
+extern "C" {
+/*
+ * Sums particle weights.
+ * Needs to run in a single block.
+ */
+__global__ void sum_weights(double *particles, double *out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    double sum = 0;
+
+    for (int i = idx; i < N_PARTICLES; i += THREADS) {
+        double *particle = get_particle(particles, i);
+        sum += (double)particle[3];
+    }
+
+    __shared__ double r[THREADS];
+    r[idx] = sum;
+    __syncthreads();
+
+    for (int size = THREADS/2; size > 0; size /= 2) {
+        if (idx < size) {
+            r[idx] += r[idx + size];
+        }
+        __syncthreads();
+    }
+
+    if (idx == 0) {
+        *out = r[0];
+    }
+}
+
+/*
+ * Rescales particle weights so that \sum_i w_i = 1
+ */
+__global__ void divide_weights(double *particles, double *s) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    double sum = s[0];
+    double *particle = get_particle(particles, i);
+
+    if(sum > 0) {
+        particle[3] /= sum;
+    } else {
+        particle[3] = 1.0/N_PARTICLES;
+    }
+}
+}
 
 
 typedef struct 
@@ -58,11 +346,6 @@ __device__ void to_coords(double *particle, double *in, double *out) {
 
     out[0] = x + range * cos(bearing + theta);
     out[1] = y + range * sin(bearing + theta);
-}
-
-__device__ double* get_particle(double *particles, int i) {
-    int max_landmarks = (int)particles[4];
-    return (particles + (6 + 7*max_landmarks)*i);
 }
 
 __device__ double* get_mean(double *particle, int i)
@@ -399,6 +682,7 @@ __device__ void update_landmarks(int id, double *particle, landmark_measurements
     // }
 }
 
+extern "C" {
 __global__ void update(
     double *particles, int block_size, int *scratchpad_mem, int scratchpad_size, double measurements_array[][2], int n_particles, int n_measurements,
     double *measurement_cov, double threshold, double range, double fov, int max_landmarks)
@@ -436,4 +720,61 @@ __global__ void update(
 
         update_landmarks(particle_id, particle, &measurements, in_range, n_matches, range, fov, threshold);
     }
+}
+
+/*
+ * Extracts weights from particles.
+ */
+__global__ void get_weights(double *particles, double *weights) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    double *particle = get_particle(particles, i);
+    weights[i] = (double)particle[3];
+}
+
+/*
+ * Calculates the mean position of all particles.
+ * Needs to run in a single block.
+ */
+__global__ void get_mean_position(double *particles, double *mean) {
+    int block_id = blockIdx.x + blockIdx.y * gridDim.x;
+    int idx = block_id * (blockDim.x * blockDim.y) + (threadIdx.y * blockDim.x) + threadIdx.x;
+
+    double x = 0;
+    double y = 0;
+    double theta = 0;
+
+    for (int i = idx; i < N_PARTICLES; i += THREADS) {
+        double *particle = get_particle(particles, i);
+        x += particle[3] * particle[0];
+        y += particle[3] * particle[1];
+        theta += particle[3] * particle[2];
+    }
+
+    __shared__ double r_x[THREADS];
+    __shared__ double r_y[THREADS];
+    __shared__ double r_theta[THREADS];
+
+    r_x[idx] = x;
+    r_y[idx] = y;
+    r_theta[idx] = theta;
+
+    __syncthreads();
+
+    for (int size = THREADS/2; size>0; size/=2) {
+        if (idx<size) {
+            r_x[idx] += r_x[idx+size];
+            r_y[idx] += r_y[idx+size];
+            r_theta[idx] += r_theta[idx+size];
+        }
+        __syncthreads();
+    }
+
+    if (idx == 0) {
+        mean[0] = r_x[0];
+        mean[1] = r_y[0];
+        mean[2] = r_theta[0];
+    }
+}
+
 }
