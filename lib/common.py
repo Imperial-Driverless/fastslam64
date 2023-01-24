@@ -1,6 +1,8 @@
 import pycuda.driver as cuda
 import numpy as np
 
+from cuda_modules import CudaModules
+
 DOUBLE = 8
 
 
@@ -42,7 +44,7 @@ class CUDAMemory:
 def get_pose_estimate(modules, config, memory: CUDAMemory):
     estimate = np.zeros(3, dtype=np.float64)
 
-    modules["weights_and_mean"].get_function("get_mean_position")(
+    modules.weights_and_mean.get_function("get_mean_position")(
         memory.particles, memory.mean_position,
         block=(config.THREADS, 1, 1)
     )
@@ -51,13 +53,13 @@ def get_pose_estimate(modules, config, memory: CUDAMemory):
     return estimate
 
 
-def rescale(modules, config, memory: CUDAMemory):
-    modules["rescale"].get_function("sum_weights")(
+def rescale(modules: CudaModules, config, memory: CUDAMemory):
+    modules.rescale.get_function("sum_weights")(
         memory.particles, memory.rescale_sum,
         block=(config.THREADS, 1, 1)
     )
 
-    modules["rescale"].get_function("divide_weights")(
+    modules.rescale.get_function("divide_weights")(
         memory.particles, memory.rescale_sum,
         block=(config.THREADS, 1, 1), grid=(config.N//config.THREADS, 1, 1)
     )
@@ -68,26 +70,26 @@ def resample(modules, config, weights, memory: CUDAMemory, rand):
 
     cuda.memcpy_htod(memory.cumsum, cumsum)
 
-    modules["resample"].get_function("systematic_resample")(
+    modules.resample.get_function("systematic_resample")(
         memory.weights, memory.cumsum, np.float64(rand), memory.ancestors,
         block=(config.THREADS, 1, 1), grid=(config.N//config.THREADS, 1, 1)
     )
 
-    modules["permute"].get_function("reset")(memory.d, np.int32(config.N), block=(
+    modules.permute.get_function("reset")(memory.d, np.int32(config.N), block=(
         config.THREADS, 1, 1), grid=(config.N//config.THREADS, 1, 1))
-    modules["permute"].get_function("prepermute")(memory.ancestors, memory.d, block=(
+    modules.permute.get_function("prepermute")(memory.ancestors, memory.d, block=(
         config.THREADS, 1, 1), grid=(config.N//config.THREADS, 1, 1))
-    modules["permute"].get_function("permute")(memory.ancestors, memory.c, memory.d, np.int32(
+    modules.permute.get_function("permute")(memory.ancestors, memory.c, memory.d, np.int32(
         config.N), block=(config.THREADS, 1, 1), grid=(config.N//config.THREADS, 1, 1))
-    modules["permute"].get_function("write_to_c")(memory.ancestors, memory.c, memory.d, block=(
+    modules.permute.get_function("write_to_c")(memory.ancestors, memory.c, memory.d, block=(
         config.THREADS, 1, 1), grid=(config.N//config.THREADS, 1, 1))
 
-    modules["resample"].get_function("copy_inplace")(
+    modules.resample.get_function("copy_inplace")(
         memory.particles, memory.c,
         block=(config.THREADS, 1, 1), grid=(config.N//config.THREADS, 1, 1)
     )
 
-    modules["resample"].get_function("reset_weights")(
+    modules.resample.get_function("reset_weights")(
         memory.particles,
         block=(config.THREADS, 1, 1), grid=(config.N//config.THREADS, 1, 1)
     )

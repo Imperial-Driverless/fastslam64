@@ -14,7 +14,7 @@ from pycuda.autoinit import context
 from pycuda.driver import limit # type: ignore
 from lib.stats import Stats
 from lib.common import CUDAMemory, resample, rescale, get_pose_estimate
-from cuda.fastslam import load_cuda_modules
+from cuda_modules import CudaModules
 
 from rclpy.node import Node
 
@@ -74,7 +74,7 @@ class FastSLAMNode(Node):
             self.ax[0].axis('scaled')
             self.ax[1].axis('scaled')
 
-        self.cuda_modules = load_cuda_modules(
+        self.cuda_modules = CudaModules(
             THREADS=num_threads,
             PARTICLE_SIZE=particle_size,
             N_PARTICLES=num_particles
@@ -88,7 +88,7 @@ class FastSLAMNode(Node):
         cuda.memcpy_htod(self.memory.particles, self.particles) # type: ignore
 
         np.random.seed(0)
-        self.cuda_modules["predict"].get_function("init_rng")(
+        self.cuda_modules.predict.get_function("init_rng")(
             np.int32(rng_seed), block=(num_threads, 1, 1), grid=(num_particles//num_threads, 1, 1)
         )
 
@@ -101,14 +101,14 @@ class FastSLAMNode(Node):
         self.stats.start_measuring("Measurement")
         self.stats.stop_measuring("Measurement")
 
-        self.cuda_modules["resample"].get_function("reset_weights")(
+        self.cuda_modules.resample.get_function("reset_weights")(
             self.memory.particles,
             block=(self.num_threads, 1, 1), grid=(self.num_particles//self.num_threads, 1, 1)
         )
 
         cuda.memcpy_htod(self.memory.measurements, measurements_rb) # type: ignore
 
-        self.cuda_modules["predict"].get_function("predict_from_imu")(
+        self.cuda_modules.predict.get_function("predict_from_imu")(
             self.memory.particles,
             np.float64(est_odometry[0]), np.float64(est_odometry[1]), np.float64(est_odometry[2]),
             np.float64(self.config.ODOMETRY_VARIANCE[0] ** 0.5), np.float64(self.config.ODOMETRY_VARIANCE[1] ** 0.5), np.float64(self.config.ODOMETRY_VARIANCE[2] ** 0.5),
@@ -117,7 +117,7 @@ class FastSLAMNode(Node):
 
         block_size = self.num_particles if self.num_particles < 32 else 32
 
-        self.cuda_modules["update"].get_function("update")(
+        self.cuda_modules.update.get_function("update")(
             self.memory.particles, np.int32(1),
             self.memory.scratchpad, np.int32(self.memory.scratchpad_block_size),
             self.memory.measurements,
@@ -140,7 +140,7 @@ class FastSLAMNode(Node):
             self.visualize(measurements_rb)
 
 
-        self.cuda_modules["weights_and_mean"].get_function("get_weights")(
+        self.cuda_modules.weights_and_mean.get_function("get_weights")(
             self.memory.particles, self.memory.weights,
             block=(self.num_threads, 1, 1), grid=(self.num_particles//self.num_threads, 1, 1)
         )
