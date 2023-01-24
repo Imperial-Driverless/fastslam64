@@ -225,13 +225,13 @@ class Experiment:
             self.stats.add_pose([pose[0], pose[1], pose[2]], estimate)
 
             if self.plot:
-                self.visualize(self.slam_algo.get_particles(), pose, self.config.sensor.MEASUREMENTS[i])
+                self.visualize(self.slam_algo.get_particles(), pose, visible_measurements)
         
         self.slam_algo.memory.free()
         self.stats.summary()
         print(self.stats.mean_path_deviation())
 
-    def visualize(self, particles: 'np.ndarray[Any, Any]', pose: tuple[float, float, float], measurements_xy: list[tuple[float, float]]):
+    def visualize(self, particles: 'np.ndarray[Any, Any]', pose: tuple[float, float, float], measurements_rb: list[tuple[float, float]]):
         
 
         self.ax[0].clear()
@@ -246,7 +246,7 @@ class Experiment:
         plot_sensor_fov(self.ax[0], pose, self.config.sensor.RANGE, self.config.sensor.FOV)
         plot_sensor_fov(self.ax[1], pose, self.config.sensor.RANGE, self.config.sensor.FOV)
 
-        visible_measurements = np.float64(measurements_xy)
+        visible_measurements = np.float64([rb2xy(pose, rb) for rb in measurements_rb])
 
         if(visible_measurements.size != 0):
             plot_connections(self.ax[0], pose, visible_measurements + pose[:2])
