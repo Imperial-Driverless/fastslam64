@@ -7,7 +7,7 @@
 #define M_PI 3.14159265359
 #endif
 
-#define PARTICLE_SIZE <<PARTICLE_SIZE>>
+
 
 __device__ double* get_particle(double *particles, int i) {
     return (particles + PARTICLE_SIZE*i);
@@ -19,7 +19,7 @@ extern "C" {
 
 // Based on https://stackoverflow.com/questions/46169633/how-to-generate-random-number-inside-pycuda-kernel    
 // Each thread has a random state
-__device__ curandState_t* states[<<N_PARTICLES>>];
+__device__ curandState_t* states[N_PARTICLES];
 
 
 // This function is only called once to initialize the rngs.

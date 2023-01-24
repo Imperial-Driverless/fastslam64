@@ -2,9 +2,9 @@
 #include <stdbool.h>
 #include <math.h>
 
-#define PARTICLE_SIZE <<PARTICLE_SIZE>>
-#define N_PARTICLES <<N_PARTICLES>>
-#define THREADS <<THREADS>>
+
+
+
 
 __device__ double* get_particle(double *particles, int i) {
     return (particles + PARTICLE_SIZE*i);

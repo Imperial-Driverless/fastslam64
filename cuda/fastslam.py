@@ -1,23 +1,15 @@
-import re
+from typing import Any
 import pycuda.driver as cuda
 from pycuda.compiler import SourceModule
-import pycuda.autoinit
+import pycuda.autoinit # type: ignore
 
-def preprocess_module(module: str, args: dict, no_extern_c=False):
+def preprocess_module(module: str, args: dict[str, Any], no_extern_c: bool=False):
     '''Replaces special markers <<...>> in cuda source code with
        values provided in the args dictionary.
 
     '''
-    def repl(match):
-        contents = match.group(1)
-        if contents in args:
-            return str(args[contents])
-        else:
-            raise Exception("Failed to replace a placeholder in the source code")
-
-
-    module = re.sub('<<([a-zA-Z][\w]*?)>>', repl, module)
-    return SourceModule(module, no_extern_c=no_extern_c)
+    options = [f'-D{key}={value}' for key, value in args.items()]
+    return SourceModule(module, no_extern_c=no_extern_c, options=options)
 
 
 def load_cuda_modules(**args):
