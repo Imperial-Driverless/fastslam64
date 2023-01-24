@@ -39,7 +39,6 @@ def xy2rb(pose, landmark):
 class FastSLAMNode(Node):
     def __init__(
         self, 
-        config: Any, 
         num_threads: int, 
         num_particles: int, 
         max_landmarks: int, 
@@ -49,7 +48,7 @@ class FastSLAMNode(Node):
         sensor_covariance: Any,
         particle_size: int,
         start_position: tuple[float, float, float],
-        plot: bool=True,
+        update_threshold: float,
     ) -> None:
 
         assert num_threads <= 1024 # cannot run more in a single block
@@ -57,7 +56,6 @@ class FastSLAMNode(Node):
         assert num_particles % num_threads == 0
         rng_seed = 0
 
-        self.config = config
         self.num_threads = num_threads
         self.num_particles = num_particles
         self.max_landmarks = max_landmarks
@@ -66,13 +64,7 @@ class FastSLAMNode(Node):
         self.odometry_variance = odometry_variance
         self.sensor_covariance = sensor_covariance
         self.particle_size = particle_size
-
-        self.plot = plot
-
-        if self.plot:
-            fig, self.ax = plt.subplots(2, 1, figsize=(10, 5))
-            self.ax[0].axis('scaled')
-            self.ax[1].axis('scaled')
+        self.update_threshold = update_threshold
 
         self.cuda_modules = CudaModules(
             THREADS=num_threads,
@@ -87,31 +79,32 @@ class FastSLAMNode(Node):
         cuda.memcpy_htod(self.memory.cov, self.sensor_covariance) # type: ignore
         cuda.memcpy_htod(self.memory.particles, self.particles) # type: ignore
 
+        self.particles_per_thread = num_particles//num_threads
+
         np.random.seed(0)
         self.cuda_modules.predict.get_function("init_rng")(
-            np.int32(rng_seed), block=(num_threads, 1, 1), grid=(num_particles//num_threads, 1, 1)
+            np.int32(rng_seed), block=(num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
         )
 
-        self.stats = Stats("Loop", "Measurement")
-        self.stats.add_pose(start_position, start_position)
+        
 
-    def measurement_callback(self, odometry: tuple[float, float, float], est_odometry: tuple[float, float, float], measurements_rb: list[tuple[float, float]]):
-        self.stats.start_measuring("Loop")
+    def get_particles(self) -> 'np.ndarray[Any, Any]':
+        cuda.memcpy_dtoh(self.particles, self.memory.particles)
+        return self.particles
 
-        self.stats.start_measuring("Measurement")
-        self.stats.stop_measuring("Measurement")
+    def measurement_callback(self, est_odometry: tuple[float, float, float], measurements_rb: list[tuple[float, float]]) -> tuple[float, float, float]:
 
         self.cuda_modules.resample.get_function("reset_weights")(
             self.memory.particles,
-            block=(self.num_threads, 1, 1), grid=(self.num_particles//self.num_threads, 1, 1)
+            block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
         )
 
-        cuda.memcpy_htod(self.memory.measurements, measurements_rb) # type: ignore
+        cuda.memcpy_htod(self.memory.measurements, np.float64(measurements_rb))
 
         self.cuda_modules.predict.get_function("predict_from_imu")(
             self.memory.particles,
             np.float64(est_odometry[0]), np.float64(est_odometry[1]), np.float64(est_odometry[2]),
-            np.float64(self.config.ODOMETRY_VARIANCE[0] ** 0.5), np.float64(self.config.ODOMETRY_VARIANCE[1] ** 0.5), np.float64(self.config.ODOMETRY_VARIANCE[2] ** 0.5),
+            np.float64(self.odometry_variance[0] ** 0.5), np.float64(self.odometry_variance[1] ** 0.5), np.float64(self.odometry_variance[2] ** 0.5),
             block=(self.max_landmarks, 1, 1), grid=(self.num_particles//self.max_landmarks, 1, 1)
         )
 
@@ -122,38 +115,124 @@ class FastSLAMNode(Node):
             self.memory.scratchpad, np.int32(self.memory.scratchpad_block_size),
             self.memory.measurements,
             np.int32(self.num_particles), np.int32(len(measurements_rb)),
-            self.memory.cov, np.float64(self.config.THRESHOLD),
+            self.memory.cov, np.float64(self.update_threshold),
             np.float64(self.sensor_range), np.float64(self.sensor_fov),
             np.int32(self.max_landmarks),
             block=(block_size, 1, 1), grid=(self.num_particles//block_size, 1, 1)
         )
 
-        rescale(self.cuda_modules, self.config, self.memory)
-        estimate = get_pose_estimate(self.cuda_modules, self.config, self.memory)
+        
+        self.cuda_modules.rescale.get_function("sum_weights")(
+            self.memory.particles, self.memory.rescale_sum,
+            block=(self.num_threads, 1, 1)
+        )
 
-        self.stats.add_pose([pose[0], pose[1], pose[2]], estimate)
+        self.cuda_modules.rescale.get_function("divide_weights")(
+            self.memory.particles, self.memory.rescale_sum,
+            block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
+        )
+
+        # get pose estimate
+        self.cuda_modules.weights_and_mean.get_function("get_mean_position")(
+            self.memory.particles, self.memory.mean_position,
+            block=(self.num_threads, 1, 1)
+        )
+
 
         # synchronize particles from cuda device to host
         cuda.memcpy_dtoh(self.particles, self.memory.particles) # type: ignore
         
-        if self.plot:
-            self.visualize(measurements_rb)
-
-
         self.cuda_modules.weights_and_mean.get_function("get_weights")(
             self.memory.particles, self.memory.weights,
-            block=(self.num_threads, 1, 1), grid=(self.num_particles//self.num_threads, 1, 1)
+            block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
         )
         cuda.memcpy_dtoh(self.weights, self.memory.weights)
 
         neff = FlatParticle.neff(self.weights)
         if neff < 0.6*self.num_particles:
-            resample(self.cuda_modules, self.config, self.weights, self.memory, 0.5)
+            cumsum = np.cumsum(self.weights)
 
-        self.stats.stop_measuring("Loop")
+            cuda.memcpy_htod(self.memory.cumsum, cumsum) # type: ignore
 
-    def visualize(self, measurements_rb: list[tuple[float, float]]):
-        cuda.memcpy_dtoh(self.particles, self.memory.particles)
+            self.cuda_modules.resample.get_function("systematic_resample")(
+                self.memory.weights, self.memory.cumsum, np.float64(0.5), self.memory.ancestors,
+                block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
+            )
+
+            self.cuda_modules.permute.get_function("reset")(self.memory.d, np.int32(self.num_particles), block=(
+                self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1))
+            self.cuda_modules.permute.get_function("prepermute")(self.memory.ancestors, self.memory.d, block=(
+                self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1))
+            self.cuda_modules.permute.get_function("permute")(self.memory.ancestors, self.memory.c, self.memory.d, np.int32(
+                self.num_particles), block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1))
+            self.cuda_modules.permute.get_function("write_to_c")(self.memory.ancestors, self.memory.c, self.memory.d, block=(
+                self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1))
+
+            self.cuda_modules.resample.get_function("copy_inplace")(
+                self.memory.particles, self.memory.c,
+                block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
+            )
+
+            self.cuda_modules.resample.get_function("reset_weights")(
+                self.memory.particles,
+                block=(self.num_threads, 1, 1), grid=(self.particles_per_thread, 1, 1)
+            )
+
+        
+        estimate = cuda.from_device(self.memory.mean_position, shape=(3,), dtype=np.float64)
+        return estimate
+
+    
+
+class Experiment:
+    def __init__(self, config: Any, plot: bool=True):
+        self.slam_algo = FastSLAMNode(
+            num_threads=config.THREADS,
+            num_particles=config.N,
+            max_landmarks=config.MAX_LANDMARKS,
+            sensor_range=config.sensor.RANGE,
+            sensor_fov=config.sensor.FOV,
+            odometry_variance=config.ODOMETRY_VARIANCE,
+            sensor_covariance=config.sensor.COVARIANCE,
+            particle_size=config.PARTICLE_SIZE,
+            start_position=config.START_POSITION,
+            update_threshold=config.THRESHOLD,
+        )
+
+        self.plot = plot
+        if self.plot:
+            _, self.ax = plt.subplots(2, 1, figsize=(10, 5))
+            self.ax[0].axis('scaled')
+            self.ax[1].axis('scaled')
+
+        self.stats = Stats("Loop")
+        self.stats.add_pose(config.START_POSITION, config.START_POSITION)
+
+        self.config = config
+
+    def run(self):
+         
+        for i in range(self.config.ODOMETRY.shape[0]):
+            pose = self.config.ODOMETRY[i]
+
+            visible_measurements = self.config.sensor.MEASUREMENTS[i]
+            visible_measurements = [xy2rb(pose, m) for m in visible_measurements]
+
+            self.stats.start_measuring("Loop")
+            estimate = self.slam_algo.measurement_callback(self.config.EST_ODOMETRY[i], visible_measurements)
+            self.stats.stop_measuring("Loop")
+
+            self.stats.add_pose([pose[0], pose[1], pose[2]], estimate)
+
+            if self.plot:
+                self.visualize(self.slam_algo.get_particles(), pose, self.config.sensor.MEASUREMENTS[i])
+        
+        self.slam_algo.memory.free()
+        self.stats.summary()
+        print(self.stats.mean_path_deviation())
+
+    def visualize(self, particles: 'np.ndarray[Any, Any]', pose: tuple[float, float, float], measurements_xy: list[tuple[float, float]]):
+        
 
         self.ax[0].clear()
         self.ax[1].clear()
@@ -164,10 +243,10 @@ class FastSLAMNode(Node):
         self.ax[0].set_axis_off()
         self.ax[1].set_axis_off()
 
-        plot_sensor_fov(self.ax[0], pose, self.sensor_range, self.sensor_fov)
-        plot_sensor_fov(self.ax[1], pose, self.sensor_range, self.sensor_fov)
+        plot_sensor_fov(self.ax[0], pose, self.config.sensor.RANGE, self.config.sensor.FOV)
+        plot_sensor_fov(self.ax[1], pose, self.config.sensor.RANGE, self.config.sensor.FOV)
 
-        visible_measurements = np.array([rb2xy(pose, m) for m in measurements_rb])
+        visible_measurements = np.float64(measurements_xy)
 
         if(visible_measurements.size != 0):
             plot_connections(self.ax[0], pose, visible_measurements + pose[:2])
@@ -177,50 +256,30 @@ class FastSLAMNode(Node):
         plot_history(self.ax[0], self.stats.predicted_path, color='orange')
         # plot_history(self.ax[0], self.config.ODOMETRY[:i], color='red')
 
-        plot_particles_weight(self.ax[0], self.particles)
+        plot_particles_weight(self.ax[0], particles)
         if(visible_measurements.size != 0):
             plot_measurement(self.ax[0], pose[:2], visible_measurements, color="orange", zorder=103)
 
-        best = np.argmax(FlatParticle.w(self.particles))
+        best = np.argmax(FlatParticle.w(particles))
         plot_landmarks(self.ax[1], self.config.LANDMARKS, color="black")
-        covariances = FlatParticle.get_covariances(self.particles, best)
+        covariances = FlatParticle.get_covariances(particles, best)
 
-        plot_map(self.ax[1], FlatParticle.get_landmarks(self.particles, best), color="orange", marker="o")
+        plot_map(self.ax[1], FlatParticle.get_landmarks(particles, best), color="orange", marker="o")
 
-        for i, landmark in enumerate(FlatParticle.get_landmarks(self.particles, best)):
+        for i, landmark in enumerate(FlatParticle.get_landmarks(particles, best)):
             plot_confidence_ellipse(self.ax[1], landmark, covariances[i], n_std=3)
 
         plt.pause(0.001)
-
-        
 
 if __name__ == "__main__":
     from config_fsonline import config
     context.set_limit(limit.MALLOC_HEAP_SIZE, config.GPU_HEAP_SIZE_BYTES) # type: ignore
 
-    slam_algo = FastSLAMNode(
-        config=config,
-        num_threads=config.THREADS,
-        num_particles=config.N,
-        max_landmarks=config.MAX_LANDMARKS,
-        sensor_range=config.sensor.RANGE,
-        sensor_fov=config.sensor.FOV,
-        odometry_variance=config.ODOMETRY_VARIANCE,
-        sensor_covariance=config.sensor.COVARIANCE,
-        particle_size=config.PARTICLE_SIZE,
-        start_position=config.START_POSITION,
-    )
+    experiment = Experiment(config, plot=True)
+    experiment.run()
 
-    for i in range(config.ODOMETRY.shape[0]):
-        pose = config.ODOMETRY[i]
+    
 
-        visible_measurements = config.sensor.MEASUREMENTS[i]
-        visible_measurements = np.array([xy2rb(pose, m) for m in visible_measurements], dtype=np.float64)
-
-        slam_algo.measurement_callback(pose, config.EST_ODOMETRY[i], visible_measurements)
-
-    slam_algo.memory.free()
-    slam_algo.stats.summary()
-    print(slam_algo.stats.mean_path_deviation())
+    
 
 
